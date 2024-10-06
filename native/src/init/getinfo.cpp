@@ -41,16 +41,16 @@ static string extract_quoted_str_until(chars<escapes...>, chars<breaks...>,
 }
 
 // Parse string into key value pairs.
-// The string format: [delim][key][padding]=[padding][value][delim]
-template<char delim, char... padding>
+// The string format: [delim][key][padding][eq][padding][value][delim]
+template<char delim, char eq, char... padding>
 static kv_pairs parse_impl(chars<padding...>, string_view str) {
     kv_pairs kv;
-    char skip_array[] = {'=', padding...};
+    char skip_array[] = {eq, padding...};
     string_view skip(skip_array, std::size(skip_array));
     bool quoted = false;
     for (size_t pos = 0u; pos < str.size(); pos = str.find_first_not_of(delim, pos)) {
         auto key = extract_quoted_str_until(
-                chars<padding..., delim>{}, chars<'='>{}, str, pos, quoted);
+                chars<padding..., delim>{}, chars<eq>{}, str, pos, quoted);
         pos = str.find_first_not_of(skip, pos);
         if (pos == string_view::npos || str[pos] == delim) {
             kv.emplace_back(key, "");
@@ -63,10 +63,13 @@ static kv_pairs parse_impl(chars<padding...>, string_view str) {
 }
 
 static kv_pairs parse_cmdline(string_view str) {
-    return parse_impl<' '>(chars<>{}, str);
+    return parse_impl<' ', '='>(chars<>{}, str);
 }
 static kv_pairs parse_bootconfig(string_view str) {
-    return parse_impl<'\n'>(chars<' '>{}, str);
+    return parse_impl<'\n', '='>(chars<' '>{}, str);
+}
+static kv_pairs parse_partition_map(std::string_view str) {
+    return parse_impl<';', ','>(chars<>{}, str);
 }
 
 #define test_bit(bit, array) (array[bit / 8] & (1 << (bit % 8)))
@@ -207,8 +210,29 @@ void load_kernel_info(BootConfig *config) {
     config->print();
 }
 
+// `androidboot.partition_map` allows associating a partition name for a raw block device
+// through a comma separated and semicolon deliminated list. For example,
+// `androidboot.partition_map=vdb,metadata;vdc,userdata` maps `vdb` to `metadata` and `vdc` to
+// `userdata`.
+// https://android.googlesource.com/platform/system/core/+/refs/heads/android13-release/init/devices.cpp#191
+
+kv_pairs load_partition_map() {
+    const string_view kPartitionMapKey = "androidboot.partition_map";
+    for (const auto &[key, value] : parse_cmdline(full_read("/proc/cmdline"))) {
+        if (key == kPartitionMapKey)
+            return parse_partition_map(value);
+    }
+    for (const auto &[key, value] : parse_bootconfig(full_read("/proc/bootconfig"))) {
+        if (key == kPartitionMapKey)
+            return parse_partition_map(value);
+    }
+    return {};
+}
+
 bool check_two_stage() {
-    if (access("/apex", F_OK) == 0)
+    if (access("/first_stage_ramdisk", F_OK) == 0)
+        return true;
+    if (access("/second_stage_resources", F_OK) == 0)
         return true;
     if (access("/system/bin/init", F_OK) == 0)
         return true;
@@ -220,7 +244,7 @@ bool check_two_stage() {
 void unxz_init(const char *init_xz, const char *init) {
     LOGD("unxz %s -> %s\n", init_xz, init);
     int fd = xopen(init, O_WRONLY | O_CREAT, 0777);
-    fd_channel ch(fd);
+    fd_stream ch(fd);
     unxz(ch, mmap_data{init_xz});
     close(fd);
     clone_attr(init_xz, init);
@@ -228,12 +252,6 @@ void unxz_init(const char *init_xz, const char *init) {
 }
 
 const char *backup_init() {
-    if (access("/.backup/init.real", F_OK) == 0)
-        return "/.backup/init.real";
-    if (access("/.backup/init.real.xz", F_OK) == 0) {
-        unxz_init("/.backup/init.real.xz", "/.backup/init.real");
-        return "/.backup/init.real";
-    }
     if (access("/.backup/init.xz", F_OK) == 0)
         unxz_init("/.backup/init.xz", "/.backup/init");
     return "/.backup/init";

@@ -13,18 +13,16 @@
 
 using namespace std;
 
-void *self_handle = nullptr;
 string native_bridge = "0";
 
 static bool is_compatible_with(uint32_t) {
-    auto name = get_prop(NBPROP);
-    android_logging();
-    hook_functions();
+    zygisk_logging();
+    hook_entry();
     ZLOGD("load success\n");
     return false;
 }
 
-extern "C" [[maybe_unused]] NativeBridgeCallbacks NativeBridgeItf{
+extern "C" [[maybe_unused]] NativeBridgeCallbacks NativeBridgeItf {
     .version = 2,
     .padding = {},
     .isCompatibleWith = &is_compatible_with,
@@ -57,12 +55,13 @@ static vector<int> get_module_fds(bool is_64_bit) {
     // All fds passed to send_fds have to be valid file descriptors.
     // To workaround this issue, send over STDOUT_FILENO as an indicator of an
     // invalid fd as it will always be /dev/null in magiskd
-    if (is_64_bit) {
 #if defined(__LP64__)
+    if (is_64_bit) {
         std::transform(module_list->begin(), module_list->end(), std::back_inserter(fds),
             [](const module_info &info) { return info.z64 < 0 ? STDOUT_FILENO : info.z64; });
+    } else
 #endif
-    } else {
+    {
         std::transform(module_list->begin(), module_list->end(), std::back_inserter(fds),
             [](const module_info &info) { return info.z32 < 0 ? STDOUT_FILENO : info.z32; });
     }
@@ -99,7 +98,11 @@ static void connect_companion(int client, bool is_64_bit) {
         zygiskd_socket = fds[0];
         if (fork_dont_care() == 0) {
             char exe[64];
-            ssprintf(exe, sizeof(exe), "%s/magisk%s", get_magisk_tmp(), (is_64_bit ? "64" : "32"));
+#if defined(__LP64__)
+            ssprintf(exe, sizeof(exe), "%s/magisk%s", get_magisk_tmp(), (is_64_bit ? "" : "32"));
+#else
+            ssprintf(exe, sizeof(exe), "%s/magisk", get_magisk_tmp());
+#endif
             // This fd has to survive exec
             fcntl(fds[1], F_SETFD, 0);
             char buf[16];
@@ -126,12 +129,10 @@ static void get_process_info(int client, const sock_cred *cred) {
 
     uint32_t flags = 0;
 
-    check_pkg_refresh();
     if (is_deny_target(uid, process)) {
         flags |= PROCESS_ON_DENYLIST;
     }
-    int manager_app_id = get_manager();
-    if (to_app_id(uid) == manager_app_id) {
+    if (get_manager(to_user_id(uid)) == uid) {
         flags |= PROCESS_IS_MAGISK_APP;
     }
     if (denylist_enforced) {

@@ -29,21 +29,23 @@ bool avd_hack = false;
 static void parse_device(devinfo *dev, const char *uevent) {
     dev->partname[0] = '\0';
     dev->devpath[0] = '\0';
+    dev->dmname[0] = '\0';
+    dev->devname[0] = '\0';
     parse_prop_file(uevent, [=](string_view key, string_view value) -> bool {
         if (key == "MAJOR")
             dev->major = parse_int(value.data());
         else if (key == "MINOR")
             dev->minor = parse_int(value.data());
         else if (key == "DEVNAME")
-            strcpy(dev->devname, value.data());
+            strscpy(dev->devname, value.data(), sizeof(dev->devname));
         else if (key == "PARTNAME")
-            strcpy(dev->partname, value.data());
+            strscpy(dev->partname, value.data(), sizeof(dev->devname));
 
         return true;
     });
 }
 
-static void collect_devices() {
+static void collect_devices(const auto &partition_map) {
     char path[PATH_MAX];
     devinfo dev{};
     if (auto dir = xopen_dir("/sys/dev/block"); dir) {
@@ -55,7 +57,13 @@ static void collect_devices() {
             sprintf(path, "/sys/dev/block/%s/dm/name", entry->d_name);
             if (access(path, F_OK) == 0) {
                 auto name = rtrim(full_read(path));
-                strcpy(dev.dmname, name.data());
+                strscpy(dev.dmname, name.data(), sizeof(dev.dmname));
+            }
+            if (auto it = std::ranges::find_if(partition_map, [&](const auto &i) {
+                return i.first == dev.devname;
+            }); dev.partname[0] == '\0' && it != partition_map.end()) {
+                // use androidboot.partition_map as partname fallback.
+                strscpy(dev.partname, it->second.data(), sizeof(dev.partname));
             }
             sprintf(path, "/sys/dev/block/%s", entry->d_name);
             xrealpath(path, dev.devpath, sizeof(dev.devpath));
@@ -70,8 +78,9 @@ static struct {
 } blk_info;
 
 static dev_t setup_block() {
+    static const auto partition_map = load_partition_map();
     if (dev_list.empty())
-        collect_devices();
+        collect_devices(partition_map);
 
     for (int tries = 0; tries < 3; ++tries) {
         for (auto &dev : dev_list) {
@@ -93,37 +102,12 @@ static dev_t setup_block() {
         // Wait 10ms and try again
         usleep(10000);
         dev_list.clear();
-        collect_devices();
+        collect_devices(partition_map);
     }
 
     // The requested partname does not exist
     return 0;
 }
-
-static void switch_root(const string &path) {
-    LOGD("Switch root to %s\n", path.data());
-    int root = xopen("/", O_RDONLY);
-    for (set<string, greater<>> mounts; auto &info : parse_mount_info("self")) {
-        if (info.target == "/" || info.target == path)
-            continue;
-        if (auto last_mount = mounts.upper_bound(info.target);
-                last_mount != mounts.end() && info.target.starts_with(*last_mount + '/')) {
-            continue;
-        }
-        mounts.emplace(info.target);
-        auto new_path = path + info.target;
-        xmkdir(new_path.data(), 0755);
-        xmount(info.target.data(), new_path.data(), nullptr, MS_MOVE, nullptr);
-    }
-    chdir(path.data());
-    xmount(path.data(), "/", nullptr, MS_MOVE, nullptr);
-    chroot(".");
-
-    LOGD("Cleaning rootfs\n");
-    frm_rf(root);
-}
-
-#define PREINITMNT MIRRDIR "/preinit"
 
 static void mount_preinit_dir(string preinit_dev) {
     if (preinit_dev.empty()) return;
@@ -134,25 +118,23 @@ static void mount_preinit_dir(string preinit_dev) {
         LOGE("Cannot find preinit %s, abort!\n", preinit_dev.data());
         return;
     }
-    xmkdir(PREINITMNT, 0);
+    xmkdir(MIRRDIR, 0);
     bool mounted = false;
     // First, find if it is already mounted
-    for (auto &info : parse_mount_info("self")) {
-        if (info.root == "/" && info.device == dev) {
-            // Already mounted, just bind mount
-            xmount(info.target.data(), PREINITMNT, nullptr, MS_BIND, nullptr);
-            mounted = true;
-            break;
-        }
+    std::string mnt_point;
+    if (rust::is_device_mounted(dev, mnt_point)) {
+        // Already mounted, just bind mount
+        xmount(mnt_point.data(), MIRRDIR, nullptr, MS_BIND, nullptr);
+        mounted = true;
     }
 
     // Since we are mounting the block device directly, make sure to ONLY mount the partitions
     // as read-only, or else the kernel might crash due to crappy drivers.
     // After the device boots up, magiskd will properly bind mount the correct partition
     // on to PREINITMIRR as writable. For more details, check bootstages.cpp
-    if (mounted || mount(PREINITDEV, PREINITMNT, "ext4", MS_RDONLY, nullptr) == 0 ||
-        mount(PREINITDEV, PREINITMNT, "f2fs", MS_RDONLY, nullptr) == 0) {
-        string preinit_dir = resolve_preinit_dir(PREINITMNT);
+    if (mounted || mount(PREINITDEV, MIRRDIR, "ext4", MS_RDONLY, nullptr) == 0 ||
+        mount(PREINITDEV, MIRRDIR, "f2fs", MS_RDONLY, nullptr) == 0) {
+        string preinit_dir = resolve_preinit_dir(MIRRDIR);
         // Create bind mount
         xmkdirs(PREINITMIRR, 0);
         if (access(preinit_dir.data(), F_OK)) {
@@ -161,7 +143,7 @@ static void mount_preinit_dir(string preinit_dev) {
             LOGD("preinit: %s\n", preinit_dir.data());
             xmount(preinit_dir.data(), PREINITMIRR, nullptr, MS_BIND, nullptr);
         }
-        xumount2(PREINITMNT, MNT_DETACH);
+        xumount2(MIRRDIR, MNT_DETACH);
     } else {
         PLOGE("Failed to mount preinit %s\n", preinit_dev.data());
         unlink(PREINITDEV);
@@ -212,14 +194,13 @@ mount_root:
         }
     }
 
-    switch_root("/system_root");
+    rust::switch_root("/system_root");
 
     // Make dev writable
     xmount("tmpfs", "/dev", "tmpfs", 0, "mode=755");
     mount_list.emplace_back("/dev");
 
-    // Use the apex folder to determine whether 2SI (Android 10+)
-    bool is_two_stage = access("/apex", F_OK) == 0;
+    bool is_two_stage = access("/system/bin/init", F_OK) == 0;
     LOGD("is_two_stage: [%d]\n", is_two_stage);
 
     // For API 28 AVD, it uses legacy SAR setup that requires
@@ -243,7 +224,7 @@ void BaseInit::exec_init() {
         if (xumount2(p.data(), MNT_DETACH) == 0)
             LOGD("Unmount [%s]\n", p.data());
     }
-    execv("/init", argv);
+    execve("/init", argv, environ);
     exit(1);
 }
 
@@ -262,8 +243,7 @@ void MagiskInit::setup_tmp(const char *path) {
     chdir("/data");
 
     xmkdir(INTLROOT, 0711);
-    xmkdir(MIRRDIR, 0);
-    xmkdir(BLOCKDIR, 0);
+    xmkdir(DEVICEDIR, 0711);
     xmkdir(WORKERDIR, 0);
 
     mount_preinit_dir(preinit_dev);
@@ -277,6 +257,22 @@ void MagiskInit::setup_tmp(const char *path) {
     xsymlink("./magiskpolicy", "supolicy");
 
     xmount(".", path, nullptr, MS_BIND, nullptr);
+
+    chdir(path);
+
+    // Prepare worker
+    xmount(WORKERDIR, WORKERDIR, nullptr, MS_BIND, nullptr);
+
+    // Use isolated devpts if kernel support
+    if (access("/dev/pts/ptmx", F_OK) == 0) {
+        xmkdirs(SHELLPTS, 0755);
+        xmount("devpts", SHELLPTS, "devpts", MS_NOSUID | MS_NOEXEC, "newinstance");
+        xmount(nullptr, SHELLPTS, nullptr, MS_PRIVATE, nullptr);
+        if (access(SHELLPTS "/ptmx", F_OK)) {
+            umount2(SHELLPTS, MNT_DETACH);
+            rmdir(SHELLPTS);
+        }
+    }
 
     chdir("/");
 }
