@@ -15,7 +15,7 @@ android {
     val canary = !Config.version.contains(".")
 
     val url = if (canary) null
-    else "https://cdn.jsdelivr.net/gh/topjohnwu/magisk-files@${Config.version}/app-release.apk"
+    else "https://github.com/topjohnwu/Magisk/releases/download/v${Config.version}/Magisk-v${Config.version}.apk"
 
     defaultConfig {
         applicationId = "com.topjohnwu.magisk"
@@ -27,9 +27,9 @@ android {
 
     buildTypes {
         release {
+            proguardFiles("proguard-rules.pro")
             isMinifyEnabled = true
             isShrinkResources = false
-            proguardFiles("proguard-rules.pro")
         }
     }
 
@@ -38,7 +38,7 @@ android {
     }
 }
 
-setupStub()
+setupStubApk()
 
 dependencies {
     implementation(project(":app:shared"))
